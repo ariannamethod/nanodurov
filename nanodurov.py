@@ -1,12 +1,12 @@
 """
 nanodurov.py — a telegram client that trains a language model on chat messages.
-
+  
 one file. telethon + pytorch. connect to a group, watch bots and humans talk,
 learn their patterns, generate text in their style. the chat is the corpus.
 the model grows with the conversation.
 
-inspired by karpathy's microGPT. dedicated to Pavel Durov, who built the
-platform where bots can't see each other but we're training on them anyway.
+dedicated to Pavel Durov, who built the platform where bots can't see each other 
+but we're training on them anyway.  
 
 usage:
     pip install telethon torch
