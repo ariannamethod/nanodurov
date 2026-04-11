@@ -1,16 +1,19 @@
 """
 nanodurov.py — a telegram client that trains a language model on chat messages.
-  
-one file. telethon + pytorch. connect to a group, watch bots and humans talk,
+
+one file. telethon + notorch. connect to a group, watch bots and humans talk,
 learn their patterns, generate text in their style. the chat is the corpus.
 the model grows with the conversation.
 
-dedicated to Pavel Durov, who built the platform where bots can't see each other 
-but we're training on them anyway.  
+dedicated to Pavel Durov, who built the platform where bots can't see each other
+but we're training on them anyway.
+
+no pytorch. no pip install torch. no 2.7 GB of your soul.
+the engine is notorch — pure C, loaded via ctypes.
 
 usage:
-    pip install telethon torch
-    python nanodurov.py                         # interactive mode
+    pip install telethon
+    python nanodurov.py                         # interactive telegram mode
     python nanodurov.py --generate "hello"      # generate from prompt
     python nanodurov.py --train-only chat.txt   # train on exported chat
 
@@ -27,17 +30,23 @@ import struct
 import hashlib
 import asyncio
 import argparse
+import random
+import ctypes
 from collections import defaultdict
 
-# --- optional imports (graceful degradation) ------------------------------------
+# --- notorch (ctypes to libnotorch) -------------------------------------------
+# the engine. no torch. no numpy. just C.
 
-try:
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
+from ariannamethod.notorch_nn import (
+    _lib, _get_tensor_struct, _NtTapeEntry, _NtTensor,
+    Tensor, Parameter, Module, Linear, Embedding, RMSNorm,
+    softmax, multinomial, seed as nt_seed,
+)
+from ariannamethod.chuck import ChuckOptimizer
+
+NOTORCH_AVAILABLE = True
+
+# --- optional telegram --------------------------------------------------------
 
 try:
     from telethon import TelegramClient, events
@@ -61,9 +70,7 @@ GROWTH_STAGES = [
     (500, 256,  8, 10, 512, 2048, 'ancient'),
 ]
 
-BATCH_SIZE = 4
 LR = 3e-4
-WEIGHT_DECAY = 0.01
 TRAIN_STEPS_PER_ROUND = 50
 AUTO_TRAIN_INTERVAL = 60  # seconds between auto-train rounds
 
@@ -149,9 +156,7 @@ class BPE:
         return raw.decode('utf-8', errors='replace')
 
     def ingest(self, text):
-        """Add text to corpus with dedup and quality filter.
-        Rejects: too short, duplicate, too repetitive, pure URLs,
-        sticker-only, emoji-only, single-word noise."""
+        """Add text to corpus with dedup and quality filter."""
         if isinstance(text, str):
             raw = text
             text = text.encode('utf-8', errors='replace')
@@ -159,21 +164,16 @@ class BPE:
             raw = text.decode('utf-8', errors='replace')
         if len(text) < 15:
             return False
-        # dedup
         h = hashlib.sha256(text).hexdigest()[:16]
         if h in self.seen_hashes:
             return False
-        # quality filters
         stripped = raw.strip()
-        # skip pure URLs
         if stripped.startswith('http://') or stripped.startswith('https://'):
             if ' ' not in stripped:
                 return False
-        # skip if >70% non-alpha (stickers, emoji floods, binary)
         alpha = sum(1 for c in stripped if c.isalpha() or c.isspace())
         if len(stripped) > 0 and alpha / len(stripped) < 0.3:
             return False
-        # skip too repetitive (same char >50%)
         if len(stripped) > 5:
             most_common = max(set(stripped), key=stripped.count)
             if stripped.count(most_common) / len(stripped) > 0.5:
@@ -233,313 +233,251 @@ class BPE:
         print(f"[bpe] loaded: {len(self.merges)} merges, {len(self.corpus)} bytes corpus")
         return True
 
-# --- transformer model ---------------------------------------------------------
-# RMSNorm, RoPE, SwiGLU, causal attention. the microGPT recipe.
-# every line here was written by someone who stared at karpathy's code
-# for too long and started seeing attention patterns in their dreams.
+# --- transformer model (notorch) -----------------------------------------------
+# RMSNorm, RoPE, SwiGLU, causal attention. backed by libnotorch via ctypes.
+# every forward/backward runs through the C tape. no torch. no numpy.
 
-if TORCH_AVAILABLE:
+class NanoDurovModel(Module):
+    """LLaMA-style transformer backed by notorch."""
 
-    class RMSNorm(nn.Module):
-        def __init__(self, dim):
-            super().__init__()
-            self.w = nn.Parameter(torch.ones(dim))
-        def forward(self, x):
-            return x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + 1e-5).type_as(x) * self.w
+    def __init__(self, vocab_size, dim, n_heads, n_layers, ctx_len):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.dim = dim
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.ctx_len = ctx_len
+        self.head_dim = dim // n_heads
+        hidden = dim * 4
 
-    class Attention(nn.Module):
-        def __init__(self, dim, n_heads):
-            super().__init__()
-            self.n_heads = n_heads
-            self.head_dim = dim // n_heads
-            self.wq = nn.Linear(dim, dim, bias=False)
-            self.wk = nn.Linear(dim, dim, bias=False)
-            self.wv = nn.Linear(dim, dim, bias=False)
-            self.wo = nn.Linear(dim, dim, bias=False)
+        # Parameters — all stored as notorch tensors
+        self.tok_emb = Embedding(vocab_size, dim)
+        self.layers = []
+        for l in range(n_layers):
+            layer = {
+                'rms1': RMSNorm(dim),
+                'wq': Linear(dim, dim),
+                'wk': Linear(dim, dim),
+                'wv': Linear(dim, dim),
+                'wo': Linear(dim, dim),
+                'rms2': RMSNorm(dim),
+                'w_gate': Linear(dim, hidden),
+                'w_up': Linear(dim, hidden),
+                'w_down': Linear(hidden, dim),
+            }
+            # register as modules
+            for k, v in layer.items():
+                setattr(self, f'l{l}_{k}', v)
+            self.layers.append(layer)
+        self.norm_f = RMSNorm(dim)
+        self.head = Linear(dim, vocab_size)
 
-        def forward(self, x, freqs_cos, freqs_sin):
-            B, T, D = x.shape
-            H, HD = self.n_heads, self.head_dim
-
-            q = self.wq(x).view(B, T, H, HD).transpose(1, 2)  # [B, H, T, HD]
-            k = self.wk(x).view(B, T, H, HD).transpose(1, 2)
-            v = self.wv(x).view(B, T, H, HD).transpose(1, 2)
-
-            # RoPE
-            q = apply_rope(q, freqs_cos, freqs_sin)
-            k = apply_rope(k, freqs_cos, freqs_sin)
-
-            # causal attention
-            att = (q @ k.transpose(-2, -1)) / math.sqrt(HD)
-            mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
-            att = att.masked_fill(mask, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            out = att @ v  # [B, H, T, HD]
-
-            out = out.transpose(1, 2).contiguous().view(B, T, D)
-            return self.wo(out)
-
-    class MLP(nn.Module):
-        def __init__(self, dim, hidden):
-            super().__init__()
-            self.w_gate = nn.Linear(dim, hidden, bias=False)
-            self.w_up = nn.Linear(dim, hidden, bias=False)
-            self.w_down = nn.Linear(hidden, dim, bias=False)
-        def forward(self, x):
-            return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
-
-    class Block(nn.Module):
-        def __init__(self, dim, n_heads, hidden):
-            super().__init__()
-            self.norm1 = RMSNorm(dim)
-            self.attn = Attention(dim, n_heads)
-            self.norm2 = RMSNorm(dim)
-            self.mlp = MLP(dim, hidden)
-        def forward(self, x, freqs_cos, freqs_sin):
-            x = x + self.attn(self.norm1(x), freqs_cos, freqs_sin)
-            x = x + self.mlp(self.norm2(x))
-            return x
-
-    class NanoDurov(nn.Module):
-        def __init__(self, vocab_size, dim, n_heads, n_layers, ctx_len):
-            super().__init__()
-            self.ctx_len = ctx_len
-            self.tok_emb = nn.Embedding(vocab_size, dim)
-            self.blocks = nn.ModuleList([
-                Block(dim, n_heads, dim * 4) for _ in range(n_layers)
+    def param_list(self):
+        """Ordered parameter list matching C training scripts."""
+        params = [self.tok_emb.weight]
+        for l in self.layers:
+            params.extend([
+                l['rms1'].weight, l['wq'].weight, l['wk'].weight,
+                l['wv'].weight, l['wo'].weight, l['rms2'].weight,
+                l['w_gate'].weight, l['w_up'].weight, l['w_down'].weight,
             ])
-            self.norm_f = RMSNorm(dim)
-            self.head = nn.Linear(dim, vocab_size, bias=False)
-            # weight tying
-            self.head.weight = self.tok_emb.weight
-            # precompute RoPE
-            self.register_buffer('freqs_cos', None)
-            self.register_buffer('freqs_sin', None)
-            self._build_rope(ctx_len, dim // n_heads)
-            self.apply(self._init_weights)
+        params.extend([self.norm_f.weight, self.head.weight])
+        return params
 
-        def _init_weights(self, m):
-            if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.02)
-            elif isinstance(m, nn.Embedding):
-                nn.init.normal_(m.weight, std=0.02)
-
-        def _build_rope(self, max_len, head_dim):
-            pos = torch.arange(max_len).unsqueeze(1)  # [T, 1]
-            dim_pairs = torch.arange(0, head_dim, 2).float()  # [HD/2]
-            freqs = 1.0 / (10000 ** (dim_pairs / head_dim))  # [HD/2]
-            angles = pos * freqs  # [T, HD/2]
-            self.freqs_cos = angles.cos()  # [T, HD/2]
-            self.freqs_sin = angles.sin()
-
-        def forward(self, idx, targets=None):
-            B, T = idx.shape
-            x = self.tok_emb(idx)
-            fc = self.freqs_cos[:T].unsqueeze(0)  # [1, T, HD/2]
-            fs = self.freqs_sin[:T].unsqueeze(0)
-            for block in self.blocks:
-                x = block(x, fc, fs)
-            x = self.norm_f(x)
-            logits = self.head(x)
-
-            loss = None
-            if targets is not None:
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-            return logits, loss
-
-        def generate(self, idx, max_new=100, temperature=0.8, top_k=40):
-            for _ in range(max_new):
-                ctx = idx[:, -self.ctx_len:]
-                logits, _ = self(ctx)
-                logits = logits[:, -1, :] / temperature
-                if top_k > 0:
-                    v, _ = torch.topk(logits, top_k)
-                    logits[logits < v[:, [-1]]] = float('-inf')
-                probs = F.softmax(logits, dim=-1)
-                next_id = torch.multinomial(probs, 1)
-                idx = torch.cat([idx, next_id], dim=1)
-                # stop on newline after some output
-                if idx.shape[1] > 10 and next_id.item() == 10:
-                    break
-            return idx
-
-    def apply_rope(x, cos, sin):
-        """Apply rotary position embedding."""
-        # x: [B, H, T, HD]
-        d2 = x.shape[-1] // 2
-        x1 = x[..., :d2]
-        x2 = x[..., d2:]
-        # cos, sin: [1, T, HD/2] → need [1, 1, T, HD/2] for broadcasting
-        cos = cos.unsqueeze(1)  # [1, 1, T, HD/2]
-        sin = sin.unsqueeze(1)
-        return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
-
-# --- chuck optimizer ------------------------------------------------------------
-# θ -= (α × S × λ_Ψ × λ_l × σ) × m̂/(√v̂ + ε) + η
-# Adam is blind. Chuck sees. Chuck remembers.
-# In memory of Carlos Ray "Chuck" Norris (1940–2026).
-#
-# Compact version: Levels 1 (loss trend), 2 (grad trend), 9 (macro patience).
-# Full version: github.com/ariannamethod/chuck
-
-if TORCH_AVAILABLE:
-
-    class Chuck(torch.optim.Optimizer):
-        """Self-aware optimizer. Drop-in AdamW replacement with dampen/boost.
-
-        When loss is falling → boost (dampen > 1). When rising → brake (dampen < 1).
-        When stagnating → inject noise. Macro patience drops LR on plateaus.
+    def forward_train(self, token_ids, target_ids):
         """
+        Full forward+backward+step through notorch tape.
+        token_ids: list[int] length ctx_len
+        target_ids: list[int] length ctx_len
+        Returns loss float.
+        """
+        CTX = len(token_ids)
+        DIM = self.dim
+        HD = self.head_dim
 
-        def __init__(self, params, lr=3e-4, betas=(0.9, 0.999), eps=1e-8,
-                     weight_decay=0.01, window=16, macro_int=500, macro_pat=3,
-                     macro_decay=0.5, verbose=0):
-            defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
-            super().__init__(params, defaults)
-            self.window = window
-            self.macro_int = macro_int
-            self.macro_pat = macro_pat
-            self.macro_decay = macro_decay
-            self.verbose = verbose
+        _lib.nt_tape_start()
+        _lib.nt_train_mode(1)
 
-            # Chuck's soul
-            self.dampen = 1.0
-            self.noise = 0.0
-            self.loss_ema = 0.0
-            self.gnorm_ema = 0.0
-            self.macro_ema = 0.0
-            self.best_macro = 1e9
-            self.lr_scale = 1.0
-            self.macro_stag = 0
-            self.macro_drops = 0
-            self.global_step = 0
+        # Register params on tape
+        params = self.param_list()
+        tape_ids = []
+        for p in params:
+            idx = _lib.nt_tape_param(p._ptr)
+            tape_ids.append(idx)
+        # Mark embedding as no-decay
+        _lib.nt_tape_no_decay(tape_ids[0])
 
-            # loss ring buffer
-            self._hist = [0.0] * window
-            self._hpos = 0
-            self._hfull = False
-            self._stag = 0
+        # Token/target tensors
+        tok_t = Tensor.zeros(CTX)
+        tgt_t = Tensor.zeros(CTX)
+        tok_t.set_data([float(x) for x in token_ids])
+        tgt_t.set_data([float(x) for x in target_ids])
+        tok_idx = _lib.nt_tape_record(tok_t._ptr, 0, -1, -1, ctypes.c_float(0))
+        tgt_idx = _lib.nt_tape_record(tgt_t._ptr, 0, -1, -1, ctypes.c_float(0))
+        tok_t._owns = False
+        tgt_t._owns = False
 
-        @torch.no_grad()
-        def step(self, closure=None, *, loss=None):
-            if closure is not None:
-                with torch.enable_grad():
-                    lv = closure()
-                    if loss is None:
-                        loss = lv.item()
+        # Forward
+        pi = 0
+        h = _lib.nt_seq_embedding(tape_ids[pi], -1, tok_idx, CTX, DIM); pi += 1
 
-            self.global_step += 1
-            W = self.window
+        for l in range(self.n_layers):
+            rms1 = tape_ids[pi]; pi += 1
+            wq = tape_ids[pi]; pi += 1
+            wk = tape_ids[pi]; pi += 1
+            wv = tape_ids[pi]; pi += 1
+            wo = tape_ids[pi]; pi += 1
+            rms2 = tape_ids[pi]; pi += 1
+            wg = tape_ids[pi]; pi += 1
+            wu = tape_ids[pi]; pi += 1
+            wd = tape_ids[pi]; pi += 1
 
-            # === Level 1: loss trend → dampen/boost ===
-            if loss is not None:
-                if self.loss_ema == 0.0:
-                    self.loss_ema = loss
-                else:
-                    self.loss_ema = 0.99 * self.loss_ema + 0.01 * loss
+            xn = _lib.nt_seq_rmsnorm(h, rms1, CTX, DIM)
+            q = _lib.nt_rope(_lib.nt_seq_linear(wq, xn, CTX), CTX, HD)
+            k = _lib.nt_rope(_lib.nt_seq_linear(wk, xn, CTX), CTX, HD)
+            v = _lib.nt_seq_linear(wv, xn, CTX)
+            attn = _lib.nt_mh_causal_attention(q, k, v, CTX, HD)
+            h = _lib.nt_add(h, _lib.nt_seq_linear(wo, attn, CTX))
 
-                self._hist[self._hpos % W] = self.loss_ema
-                self._hpos += 1
-                if self._hpos >= W:
-                    self._hfull = True
+            xn = _lib.nt_seq_rmsnorm(h, rms2, CTX, DIM)
+            gate = _lib.nt_silu(_lib.nt_seq_linear(wg, xn, CTX))
+            up = _lib.nt_seq_linear(wu, xn, CTX)
+            h = _lib.nt_add(h, _lib.nt_seq_linear(wd, _lib.nt_mul(gate, up), CTX))
 
-                if self._hfull:
-                    q = W // 4
-                    recent = sum(self._hist[(self._hpos - 1 - i) % W] for i in range(q)) / q
-                    old = sum(self._hist[(self._hpos - W + i) % W] for i in range(q)) / q
-                    trend = (recent - old) / (old + 1e-8)
-                    if trend > 0.02:
-                        self.dampen *= 0.97   # loss rising → brake
-                    elif trend < -0.02:
-                        self.dampen *= 1.03   # loss falling → push
-                    if abs(trend) < 0.001:
-                        self._stag += 1
-                        if self._stag > 8:
-                            self.noise = 0.001
-                            self._stag = 0
-                    else:
-                        self._stag = 0
-                        self.noise *= 0.9
-                    # mean reversion
-                    self.dampen = 0.999 * self.dampen + 0.001 * 1.0
-                    self.dampen = max(0.3, min(2.0, self.dampen))
+        rmsf = tape_ids[pi]; pi += 1
+        head = tape_ids[pi]; pi += 1
+        hf = _lib.nt_seq_rmsnorm(h, rmsf, CTX, DIM)
+        logits_idx = _lib.nt_seq_linear(head, hf, CTX)
+        loss_idx = _lib.nt_seq_cross_entropy(logits_idx, tgt_idx, CTX, self.vocab_size)
 
-                # === Level 9: macro patience ===
-                if self.macro_ema == 0.0:
-                    self.macro_ema = loss
-                else:
-                    self.macro_ema = 0.999 * self.macro_ema + 0.001 * loss
-                if self.global_step % self.macro_int == 0 and self.global_step > W:
-                    if self.macro_ema > self.best_macro * 0.999:
-                        self.macro_stag += 1
-                        if self.macro_stag >= self.macro_pat:
-                            self.lr_scale *= self.macro_decay
-                            if self.lr_scale < 0.05:
-                                self.lr_scale = 0.05
-                            self.macro_stag = 0
-                            self.macro_drops += 1
-                    else:
-                        self.best_macro = self.macro_ema
-                        self.macro_stag = 0
-                        if self.lr_scale < 1.0:
-                            self.lr_scale = min(1.0, self.lr_scale * 1.2)
+        # Read loss from tape
+        tape_ptr = _lib.nt_tape_get()
+        entry_size = ctypes.sizeof(_NtTapeEntry)
+        tape_addr = ctypes.cast(tape_ptr, ctypes.c_void_p).value
+        loss_entry = ctypes.cast(
+            tape_addr + loss_idx * entry_size,
+            ctypes.POINTER(_NtTapeEntry)
+        ).contents
+        loss_tensor = ctypes.cast(loss_entry.output, ctypes.POINTER(_NtTensor)).contents
+        loss_val = loss_tensor.data[0]
 
-            # === Adam update with Chuck modulation ===
-            effective_dampen = self.dampen * self.lr_scale
-            for group in self.param_groups:
-                lr = group['lr'] * effective_dampen
-                beta1, beta2 = group['betas']
-                eps = group['eps']
-                wd = group['weight_decay']
+        return loss_idx, loss_val
 
-                for p in group['params']:
-                    if p.grad is None:
-                        continue
-                    g = p.grad
-                    state = self.state[p]
+    def backward_step(self, loss_idx, loss_val, lr):
+        """Backward + Chuck step + clear tape."""
+        _lib.nt_tape_backward(loss_idx)
+        _lib.nt_tape_clip_grads(ctypes.c_float(1.0))
+        _lib.nt_tape_chuck_step(ctypes.c_float(lr), ctypes.c_float(loss_val))
+        _lib.nt_tape_clear()
 
-                    if len(state) == 0:
-                        state['step'] = 0
-                        state['m'] = torch.zeros_like(p)
-                        state['v'] = torch.zeros_like(p)
+    def generate(self, token_ids, max_new=100, temperature=0.8, top_k=40):
+        """Generate tokens using forward pass (no tape, inference only)."""
+        _lib.nt_train_mode(0)
+        ctx = list(token_ids)
 
-                    state['step'] += 1
-                    m, v = state['m'], state['v']
+        for _ in range(max_new):
+            if len(ctx) > self.ctx_len:
+                ctx = ctx[-self.ctx_len:]
+            CTX = len(ctx)
 
-                    m.mul_(beta1).add_(g, alpha=1 - beta1)
-                    v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+            _lib.nt_tape_start()
+            params = self.param_list()
+            tape_ids = [_lib.nt_tape_param(p._ptr) for p in params]
 
-                    bc1 = 1 - beta1 ** state['step']
-                    bc2 = 1 - beta2 ** state['step']
-                    m_hat = m / bc1
-                    v_hat = v / bc2
+            tok_t = Tensor.zeros(CTX)
+            tgt_t = Tensor.zeros(CTX)
+            tok_t.set_data([float(x) for x in ctx])
+            tok_idx = _lib.nt_tape_record(tok_t._ptr, 0, -1, -1, ctypes.c_float(0))
+            tgt_idx = _lib.nt_tape_record(tgt_t._ptr, 0, -1, -1, ctypes.c_float(0))
+            tok_t._owns = False
+            tgt_t._owns = False
 
-                    # noise injection on stagnation
-                    if self.noise > 0:
-                        m_hat = m_hat + self.noise * torch.randn_like(m_hat)
+            pi = 0
+            h = _lib.nt_seq_embedding(tape_ids[pi], -1, tok_idx, CTX, self.dim); pi += 1
+            for l in range(self.n_layers):
+                rms1=tape_ids[pi]; pi+=1
+                wq=tape_ids[pi]; pi+=1; wk=tape_ids[pi]; pi+=1
+                wv=tape_ids[pi]; pi+=1; wo=tape_ids[pi]; pi+=1
+                rms2=tape_ids[pi]; pi+=1
+                wg=tape_ids[pi]; pi+=1; wu=tape_ids[pi]; pi+=1; wd=tape_ids[pi]; pi+=1
+                xn = _lib.nt_seq_rmsnorm(h, rms1, CTX, self.dim)
+                q = _lib.nt_rope(_lib.nt_seq_linear(wq, xn, CTX), CTX, self.head_dim)
+                k = _lib.nt_rope(_lib.nt_seq_linear(wk, xn, CTX), CTX, self.head_dim)
+                v = _lib.nt_seq_linear(wv, xn, CTX)
+                attn = _lib.nt_mh_causal_attention(q, k, v, CTX, self.head_dim)
+                h = _lib.nt_add(h, _lib.nt_seq_linear(wo, attn, CTX))
+                xn = _lib.nt_seq_rmsnorm(h, rms2, CTX, self.dim)
+                gate = _lib.nt_silu(_lib.nt_seq_linear(wg, xn, CTX))
+                up = _lib.nt_seq_linear(wu, xn, CTX)
+                h = _lib.nt_add(h, _lib.nt_seq_linear(wd, _lib.nt_mul(gate, up), CTX))
 
-                    # weight decay (decoupled)
-                    if wd > 0:
-                        p.add_(p, alpha=-lr * wd)
+            rmsf=tape_ids[pi]; pi+=1; head_i=tape_ids[pi]; pi+=1
+            hf = _lib.nt_seq_rmsnorm(h, rmsf, CTX, self.dim)
+            logits_idx = _lib.nt_seq_linear(head_i, hf, CTX)
 
-                    # update
-                    p.addcdiv_(m_hat, v_hat.sqrt().add_(eps), value=-lr)
+            # Get logits for last position
+            tape_ptr = _lib.nt_tape_get()
+            entry_size = ctypes.sizeof(_NtTapeEntry)
+            tape_addr = ctypes.cast(tape_ptr, ctypes.c_void_p).value
+            logits_entry = ctypes.cast(
+                tape_addr + logits_idx * entry_size,
+                ctypes.POINTER(_NtTapeEntry)
+            ).contents
+            logits_t = ctypes.cast(logits_entry.output, ctypes.POINTER(_NtTensor)).contents
+            # Last position logits
+            offset = (CTX - 1) * self.vocab_size
+            raw_logits = [logits_t.data[offset + i] / temperature for i in range(self.vocab_size)]
 
-            if self.verbose > 0 and self.global_step % self.verbose == 0:
-                print(f"  chuck: step={self.global_step} λ={self.dampen:.3f} "
-                      f"lr_scale={self.lr_scale:.3f} noise={self.noise:.4f} "
-                      f"macro_drops={self.macro_drops}")
+            # Top-k
+            if top_k > 0 and top_k < self.vocab_size:
+                sorted_vals = sorted(raw_logits, reverse=True)
+                threshold = sorted_vals[min(top_k - 1, len(sorted_vals) - 1)]
+                raw_logits = [v if v >= threshold else -1e30 for v in raw_logits]
 
-# --- training loop --------------------------------------------------------------
+            probs = softmax(raw_logits)
+            next_id = multinomial(probs)
+
+            _lib.nt_tape_clear()
+
+            ctx.append(next_id)
+            if next_id == 10 and len(ctx) > len(token_ids) + 5:  # newline
+                break
+
+        return ctx[len(token_ids):]
+
+    def save_weights(self, path):
+        """Save weights using nt_save."""
+        params = self.param_list()
+        n = len(params)
+        arr = (ctypes.c_void_p * n)(*[p._ptr for p in params])
+        _lib.nt_save(path.encode(), arr, n)
+
+    def load_weights(self, path):
+        """Load weights using nt_load."""
+        if not os.path.exists(path):
+            return False
+        n_loaded = ctypes.c_int(0)
+        loaded = _lib.nt_load(path.encode(), ctypes.byref(n_loaded))
+        if not loaded:
+            return False
+        params = self.param_list()
+        for i in range(min(n_loaded.value, len(params))):
+            src = _get_tensor_struct(loaded[i])
+            dst = _get_tensor_struct(params[i]._ptr)
+            if src.len == dst.len:
+                ctypes.memmove(dst.data, src.data, dst.len * 4)
+            _lib.nt_tensor_free(loaded[i])
+        return True
+
+
+# --- trainer -------------------------------------------------------------------
 # the part where numbers go down and hope goes up.
 # or numbers go up and you stare at the ceiling.
 
 class Trainer:
-    def __init__(self, bpe, device='cpu'):
+    def __init__(self, bpe):
         self.bpe = bpe
-        self.device = device
         self.model = None
-        self.optimizer = None
         self.stage_name = None
         self.total_steps = 0
         self.best_loss = float('inf')
@@ -547,10 +485,6 @@ class Trainer:
 
     def _ensure_model(self):
         """Create or grow model based on corpus size."""
-        if not TORCH_AVAILABLE:
-            print("[train] no pytorch. install: pip install torch")
-            return False
-
         stage = get_stage(len(self.bpe.corpus))
         _, dim, n_heads, n_layers, ctx_len, max_merges, name = stage
 
@@ -558,51 +492,18 @@ class Trainer:
             return True
 
         old_name = self.stage_name
-        old_state = self.model.state_dict() if self.model else None
-
         self.bpe.max_merges = max_merges
         vocab_size = 256 + max_merges
 
-        self.model = NanoDurov(vocab_size, dim, n_heads, n_layers, ctx_len)
-        self.model.to(self.device)
-
-        # copy weights from old model where shapes match
-        if old_state:
-            new_state = self.model.state_dict()
-            copied = 0
-            for k in old_state:
-                if k in new_state and old_state[k].shape == new_state[k].shape:
-                    new_state[k] = old_state[k]
-                    copied += 1
-                elif k in new_state and len(old_state[k].shape) == len(new_state[k].shape):
-                    # partial copy: take min of each dim
-                    old_t = old_state[k]
-                    new_t = new_state[k]
-                    slices = tuple(slice(0, min(o, n)) for o, n in zip(old_t.shape, new_t.shape))
-                    new_state[k][slices] = old_t[slices]
-                    copied += 1
-            self.model.load_state_dict(new_state)
-            print(f"[model] GREW: {old_name} → {name} (copied {copied} tensors)")
-
-        self.optimizer = Chuck(
-            self.model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY,
-            verbose=0)
+        self.model = NanoDurovModel(vocab_size, dim, n_heads, n_layers, ctx_len)
         self.stage_name = name
 
-        n_params = sum(p.numel() for p in self.model.parameters())
+        n_params = sum(p.numel for p in self.model.param_list())
         print(f"[model] {name}: {n_params:,} params, dim={dim}, "
               f"layers={n_layers}, heads={n_heads}, ctx={ctx_len}")
+        if old_name:
+            print(f"[model] GREW: {old_name} → {name}")
         return True
-
-    def _get_batch(self, token_ids, batch_size, ctx_len):
-        """Random batch of training windows."""
-        n = len(token_ids)
-        if n <= ctx_len + 1:
-            return None, None
-        ix = torch.randint(0, n - ctx_len - 1, (batch_size,))
-        x = torch.stack([torch.tensor(token_ids[i:i+ctx_len], dtype=torch.long) for i in ix])
-        y = torch.stack([torch.tensor(token_ids[i+1:i+ctx_len+1], dtype=torch.long) for i in ix])
-        return x.to(self.device), y.to(self.device)
 
     def tokenize(self):
         """Tokenize corpus, learning merges if needed."""
@@ -624,7 +525,6 @@ class Trainer:
         stage = get_stage(len(self.bpe.corpus))
         ctx_len = stage[4]
 
-        # tokenize if needed
         if self._token_ids is None:
             self.tokenize()
         if self._token_ids is None or len(self._token_ids) < ctx_len + 1:
@@ -632,30 +532,27 @@ class Trainer:
                 print(f"[train] not enough tokens ({len(self._token_ids) if self._token_ids else 0})")
             return None
 
-        # clamp token ids to vocab
         vocab = self.bpe.vocab_size
         ids = [min(t, vocab - 1) for t in self._token_ids]
 
-        self.model.train()
         losses = []
         t0 = time.time()
 
         for step in range(steps):
-            x, y = self._get_batch(ids, BATCH_SIZE, ctx_len)
-            if x is None:
-                break
-            _, loss = self.model(x, y)
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step(loss=loss.item())
+            # random window
+            off = random.randint(0, len(ids) - ctx_len - 1)
+            tokens = ids[off:off + ctx_len]
+            targets = ids[off + 1:off + ctx_len + 1]
 
-            losses.append(loss.item())
+            loss_idx, loss_val = self.model.forward_train(tokens, targets)
+            self.model.backward_step(loss_idx, loss_val, LR)
+
+            losses.append(loss_val)
             self.total_steps += 1
 
             if verbose and (step + 1) % 10 == 0:
                 avg = sum(losses[-10:]) / len(losses[-10:])
-                print(f"  step {self.total_steps} | loss {avg:.4f}")
+                print(f"  step {self.total_steps} | train {avg:.4f}")
 
         elapsed = time.time() - t0
         avg_loss = sum(losses) / len(losses) if losses else 0
@@ -664,83 +561,60 @@ class Trainer:
 
         if verbose:
             print(f"[train] {len(losses)} steps in {elapsed:.1f}s | "
-                  f"loss {avg_loss:.4f} | best {self.best_loss:.4f} | "
+                  f"train {avg_loss:.4f} | best {self.best_loss:.4f} | "
                   f"stage={self.stage_name}")
 
-        # check growth after training
         self._ensure_model()
         return avg_loss
 
-    @torch.no_grad()
     def generate(self, prompt, max_new=100, temperature=0.8):
         """Generate text from prompt."""
         if not self.model:
             return "[no model trained yet]"
-        self.model.eval()
         ids = self.bpe.encode(prompt)
         if not ids:
             ids = [0]
-        # clamp to vocab
         ids = [min(t, self.bpe.vocab_size - 1) for t in ids]
-        idx = torch.tensor([ids], dtype=torch.long, device=self.device)
-        out = self.model.generate(idx, max_new=max_new, temperature=temperature)
-        generated = out[0, len(ids):].tolist()
+        generated = self.model.generate(ids, max_new=max_new, temperature=temperature)
         return self.bpe.decode(generated)
 
     def save(self, path):
         if not self.model:
             return
-        ckpt = {
-            'model': self.model.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'stage': self.stage_name,
-            'total_steps': self.total_steps,
-            'best_loss': self.best_loss,
-        }
-        # save Chuck's soul
-        if hasattr(self.optimizer, 'dampen'):
-            ckpt['chuck'] = {
-                'dampen': self.optimizer.dampen,
-                'lr_scale': self.optimizer.lr_scale,
-                'loss_ema': self.optimizer.loss_ema,
-                'macro_ema': self.optimizer.macro_ema,
-                'best_macro': self.optimizer.best_macro,
-                'macro_drops': self.optimizer.macro_drops,
-                'global_step': self.optimizer.global_step,
-            }
-        torch.save(ckpt, path)
-        print(f"[train] saved checkpoint to {path}")
+        self.model.save_weights(path)
+        # save metadata alongside
+        meta_path = path + '.meta'
+        with open(meta_path, 'w') as f:
+            f.write(f"{self.stage_name}\n{self.total_steps}\n{self.best_loss}\n")
+            f.write(f"{self.model.vocab_size}\n{self.model.dim}\n")
+            f.write(f"{self.model.n_heads}\n{self.model.n_layers}\n{self.model.ctx_len}\n")
+        print(f"[train] saved to {path}")
 
     def load(self, path):
         if not os.path.exists(path):
             return False
-        if not self._ensure_model():
+        meta_path = path + '.meta'
+        if not os.path.exists(meta_path):
             return False
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        try:
-            self.model.load_state_dict(ckpt['model'], strict=False)
-            self.total_steps = ckpt.get('total_steps', 0)
-            self.best_loss = ckpt.get('best_loss', float('inf'))
-            # restore Chuck's soul
-            if 'chuck' in ckpt and hasattr(self.optimizer, 'dampen'):
-                cs = ckpt['chuck']
-                self.optimizer.dampen = cs.get('dampen', 1.0)
-                self.optimizer.lr_scale = cs.get('lr_scale', 1.0)
-                self.optimizer.loss_ema = cs.get('loss_ema', 0.0)
-                self.optimizer.macro_ema = cs.get('macro_ema', 0.0)
-                self.optimizer.best_macro = cs.get('best_macro', 1e9)
-                self.optimizer.macro_drops = cs.get('macro_drops', 0)
-                self.optimizer.global_step = cs.get('global_step', 0)
-            # try to restore optimizer state (may fail after growth)
-            try:
-                self.optimizer.load_state_dict(ckpt['optimizer'])
-            except (ValueError, KeyError):
-                pass  # model grew, optimizer state doesn't match — fresh Adam state
-            print(f"[train] loaded checkpoint: step={self.total_steps}, loss={self.best_loss:.4f}")
+        with open(meta_path) as f:
+            lines = f.read().strip().split('\n')
+        if len(lines) < 8:
+            return False
+        self.stage_name = lines[0]
+        self.total_steps = int(lines[1])
+        self.best_loss = float(lines[2])
+        vocab_size = int(lines[3])
+        dim = int(lines[4])
+        n_heads = int(lines[5])
+        n_layers = int(lines[6])
+        ctx_len = int(lines[7])
+        self.model = NanoDurovModel(vocab_size, dim, n_heads, n_layers, ctx_len)
+        if self.model.load_weights(path):
+            n_params = sum(p.numel for p in self.model.param_list())
+            print(f"[train] loaded: step={self.total_steps}, loss={self.best_loss:.4f}, "
+                  f"params={n_params:,}")
             return True
-        except Exception as e:
-            print(f"[train] checkpoint load failed (model grew?): {e}")
-            return False
+        return False
 
 # --- telegram client -----------------------------------------------------------
 # MTProto observer. sees all messages including bot-to-bot.
@@ -762,7 +636,6 @@ async def run_telegram(trainer):
     await client.start()
     print("[telegram] connected")
 
-    # choose group
     group_input = input("\nGroup @username or ID: ").strip()
     try:
         entity = await client.get_entity(group_input)
@@ -772,24 +645,20 @@ async def run_telegram(trainer):
         print(f"[telegram] can't find group: {e}")
         return
 
-    # load history
     print("[telegram] loading history...")
     messages = await client.get_messages(entity, limit=500)
     for msg in reversed(messages):
         if msg.message:
             sender = await msg.get_sender()
             name = _sender_name(sender)
-            bot = _is_bot(sender)
             line = f"[{name}]: {msg.message}"
             trainer.bpe.ingest(line)
     print(f"[telegram] ingested {len(trainer.bpe.corpus)} bytes from history")
 
-    # initial train if we have data
     if len(trainer.bpe.corpus) > 500:
         trainer.tokenize()
         trainer.train(steps=TRAIN_STEPS_PER_ROUND)
 
-    # message handler — observe + ingest
     @client.on(events.NewMessage(chats=entity))
     async def handler(event):
         msg = event.message
@@ -801,12 +670,9 @@ async def run_telegram(trainer):
         tag = " [BOT]" if bot else ""
         ts = msg.date.strftime("%H:%M:%S") if msg.date else "??:??:??"
         print(f"[{ts}] {name}{tag}: {msg.message}")
-
-        # ingest
         line = f"[{name}]: {msg.message}"
         trainer.bpe.ingest(line)
 
-    # auto-train loop — only trains when there's meaningful new data
     last_corpus_size = len(trainer.bpe.corpus)
     async def auto_train():
         nonlocal last_corpus_size
@@ -814,17 +680,15 @@ async def run_telegram(trainer):
             await asyncio.sleep(AUTO_TRAIN_INTERVAL)
             corpus_size = len(trainer.bpe.corpus)
             new_bytes = corpus_size - last_corpus_size
-            # only train if at least 1KB of new data since last train
             if corpus_size > 500 and new_bytes > 1024:
                 print(f"\n[auto-train] +{new_bytes/1024:.1f}KB new data, training...")
                 last_corpus_size = corpus_size
                 trainer.tokenize()
                 trainer.train(steps=TRAIN_STEPS_PER_ROUND)
                 trainer.bpe.save('nanodurov_bpe.bin')
-                trainer.save('nanodurov_ckpt.pt')
+                trainer.save('nanodurov_weights.bin')
                 print("[auto-train] done. watching...\n")
 
-    # input handler — user can type messages or commands
     async def input_loop():
         loop = asyncio.get_event_loop()
         while True:
@@ -839,7 +703,7 @@ async def run_telegram(trainer):
             if line == '/quit':
                 print("saving...")
                 trainer.bpe.save('nanodurov_bpe.bin')
-                trainer.save('nanodurov_ckpt.pt')
+                trainer.save('nanodurov_weights.bin')
                 await client.disconnect()
                 break
             elif line == '/train':
@@ -848,16 +712,16 @@ async def run_telegram(trainer):
             elif line.startswith('/generate') or line.startswith('/ai'):
                 prompt = line.split(' ', 1)[1] if ' ' in line else '[User]: '
                 text = trainer.generate(prompt)
-                print(f"  🧠 {text}")
+                print(f"  > {text}")
             elif line == '/status':
-                n = sum(p.numel() for p in trainer.model.parameters()) if trainer.model else 0
+                n = sum(p.numel for p in trainer.model.param_list()) if trainer.model else 0
                 print(f"  stage={trainer.stage_name} params={n:,} "
                       f"steps={trainer.total_steps} loss={trainer.best_loss:.4f} "
                       f"corpus={len(trainer.bpe.corpus)/1024:.1f}KB "
                       f"vocab={trainer.bpe.vocab_size}")
             elif line == '/save':
                 trainer.bpe.save('nanodurov_bpe.bin')
-                trainer.save('nanodurov_ckpt.pt')
+                trainer.save('nanodurov_weights.bin')
             elif line == '/history':
                 msgs = await client.get_messages(entity, limit=20)
                 for m in reversed(msgs):
@@ -868,17 +732,12 @@ async def run_telegram(trainer):
                         ts = m.date.strftime("%H:%M:%S") if m.date else "??:??:??"
                         print(f"  [{ts}] {n}{b}: {m.message}")
             else:
-                # send as user message
                 await client.send_message(entity, line)
 
     print("Commands: /train /generate <prompt> /ai <prompt> /status /save /history /quit")
-    print("Anything else is sent as a message. Auto-train runs every "
-          f"{AUTO_TRAIN_INTERVAL}s.\n")
+    print(f"Anything else is sent as a message. Auto-train every {AUTO_TRAIN_INTERVAL}s.\n")
 
-    await asyncio.gather(
-        auto_train(),
-        input_loop(),
-    )
+    await asyncio.gather(auto_train(), input_loop())
 
 def _sender_name(sender):
     if sender is None:
@@ -895,34 +754,34 @@ def _is_bot(sender):
     return isinstance(sender, User) and sender.bot
 
 # --- main ----------------------------------------------------------------------
-# where the threads converge and the magic begins.
-# or crashes. usually crashes first, then magic.
 
 def main():
     parser = argparse.ArgumentParser(description='nanodurov — telegram chat that learns')
     parser.add_argument('--generate', type=str, help='generate from prompt (offline)')
     parser.add_argument('--train-only', type=str, help='train on text file (no telegram)')
     parser.add_argument('--steps', type=int, default=200, help='training steps')
-    parser.add_argument('--device', type=str, default='cpu', help='cpu or cuda or mps')
     args = parser.parse_args()
 
-    # init
+    nt_seed(42)
+
     bpe = BPE(max_merges=256)
     bpe.load('nanodurov_bpe.bin')
-    trainer = Trainer(bpe, device=args.device)
-    trainer.load('nanodurov_ckpt.pt')
+    trainer = Trainer(bpe)
+    trainer.load('nanodurov_weights.bin')
 
     if args.train_only:
-        # offline training on text file
         print(f"[main] training on {args.train_only}")
         with open(args.train_only, 'r') as f:
             text = f.read()
         bpe.ingest(text)
         trainer.tokenize()
         for r in range(args.steps // TRAIN_STEPS_PER_ROUND + 1):
-            trainer.train(steps=min(TRAIN_STEPS_PER_ROUND, args.steps - r * TRAIN_STEPS_PER_ROUND))
+            remaining = args.steps - r * TRAIN_STEPS_PER_ROUND
+            if remaining <= 0:
+                break
+            trainer.train(steps=min(TRAIN_STEPS_PER_ROUND, remaining))
         bpe.save('nanodurov_bpe.bin')
-        trainer.save('nanodurov_ckpt.pt')
+        trainer.save('nanodurov_weights.bin')
         print("[main] done.")
         return
 
@@ -931,19 +790,15 @@ def main():
         print(text)
         return
 
-    # telegram mode
     if not TELETHON_AVAILABLE:
         print("pip install telethon")
-        sys.exit(1)
-    if not TORCH_AVAILABLE:
-        print("pip install torch")
         sys.exit(1)
 
     print("""
 ╔═══════════════════════════════════════════════════╗
 ║               n a n o d u r o v                   ║
 ║     telegram client that learns from chat         ║
-║     one file. one model. one act of defiance.     ║
+║     notorch + chuck. no pytorch. no excuses.      ║
 ╚═══════════════════════════════════════════════════╝
     """)
 
