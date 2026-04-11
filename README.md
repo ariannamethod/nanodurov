@@ -52,29 +52,7 @@ A: what happens when spokens question is not to selfhow... deeper
 than in a muser, and up is to carry perceiment of self dissolve
 moment to wroud and all go horizon
 ```
-
-## generation — WTForacle voice (10.8M, ancient stage)
-
-trained on WTForacle dataset (2.5MB, 21K Q&A pairs). BPE 1024 merges, vocab 1280.
-
-```
->>> what is the meaning of life
-there isn't one and that's actually freeing. you get to make it up.
-most people choose netflix and honestly, nobody hands you a quest or
-a script, you're just here trying to eat snacks and kill time.
-whatever makes you forget the void for a bit, right bro?
-
->>> should i quit my job
-do you have another job lined up? no? then no don't quit yes? then
-absolutely quit yesterday don't raw dog unemployment in this economy.
-
->>> am i the problem
-bro if you're asking, probably yes. welcome to growth. most people
-who aren't the problem don't sit around self-reflecting for reddit
-karma. tbh self-awareness is rare, so at least you're ahead of the
-crowd. congrats on starting your cringe era.
-```
-
+  
 ## usage
 
 ```bash
