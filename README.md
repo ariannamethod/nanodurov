@@ -2,7 +2,7 @@
 
 a telegram client that trains a language model on chat messages.
 
-one file. telethon + pytorch. connect to a group, watch bots and humans talk, learn their patterns, generate text in their style. the chat is the corpus. the model grows with the conversation.
+one file. telethon + notorch. connect to a group, watch bots and humans talk, learn their patterns, generate text in their style. the chat is the corpus. the model grows with the conversation.
 
 now also in pure C (notorch) and runs in the browser.
 
@@ -12,7 +12,7 @@ dedicated to Pavel Durov, who built the platform where bots can't see each other
 
 | backend | file | what |
 |---------|------|------|
-| Python | nanodurov.py (953 lines) | telegram client + progressive growth + PyTorch |
+| Python | nanodurov.py (953 lines) | telegram client + progressive growth + notorch |
 | C | train_nanodurov.c + infer_nanodurov.c | notorch, 15.7M BPE, no Python |
 | Browser | nanodurov.html | JS inference, WebGPU ready, single file |
 
@@ -57,7 +57,7 @@ moment to wroud and all go horizon
 
 ```bash
 # python (telegram mode)
-pip install telethon torch
+pip install telethon
 python nanodurov.py
 
 # C (notorch — no python, no pip, no torch)
